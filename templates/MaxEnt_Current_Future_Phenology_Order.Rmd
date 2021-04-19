@@ -1,0 +1,397 @@
+---
+output: 
+    html_document:
+        code_folding: hide
+params:
+    dynamictitle: "output"
+    species_val: "Scientifica nameia"
+    order: "Lepidoptera"
+title: "`r params$dynamictitle`"
+---
+```{r, message = FALSE, warning = FALSE, echo = FALSE}
+library(VTatlas)
+library(sf)
+library(mapedit)
+library(leaflet)
+library(raster)
+library(dismo)
+library(DBI)
+library(RPostgres)
+library(rpostgis)
+library(dbplyr)
+library(dplyr)
+```
+
+```{r, echo = FALSE}
+# Once this is automated it'll pull the sppVal from a console input when 
+# running the job
+
+##BSUB -q short
+##BSUB -n 1
+##BSUB -J "LepSpecies_MaxEnt[1-#NLEPS HERE]"
+##BSUB -o "path/to/output/file on HPC_%I.out"
+##BSUB -e "path/to/error/file on HPC_%I.err"
+##BSUB -R "rusage[mem=18000]"
+##BSUB -R "span[hosts=1]"
+##BSUB -W 04:00
+##BSUB -L /bin/bash
+#module load R/3.5.1_gcc8.1.0; # load required modules
+#module load gcc/8.1.0;
+#module load gdal/3.0.4;
+#module load geos/3.7.1;
+#module load libpng/1.6.36;
+#module load proj/6.0.0;
+#Rscript path/to/R script $LSB_JOBINDEX
+
+# this is one of the first lines in the R script to pull the $LSB_JOBINDEX
+# into the R script to tell R which species to run the analysis for. 
+
+#(sppVal <- as.numeric(commandArgs()[7]))
+
+# sppVal <- as.numeric(params$sppVal)
+
+# sppVal <- 2
+```
+
+```{r, echo = FALSE}
+# connect to local database
+SpatialDb <- DBI::dbConnect(RPostgres::Postgres(),
+                            dbname = 'vt-atlas-spatial',
+                            host = 'localhost', # i.e. 'ec2-54-83-201-96.compute-1.amazonaws.com'
+                            port = 5432, # or any other port 
+                            user = 'postgres',
+                            password = 'Squirr3lNutk!n')
+
+```
+
+```{r, warning = FALSE, message = FALSE, echo = FALSE}
+### 1) Index for a species 
+
+## Here I query the database for species within an order
+
+a <- Sys.time()
+SPP <- queryAPI(query = list(paste0("order:",params$order)),
+                 fields = c("taxon_name"))
+Sys.time()-a
+
+species <- unique(SPP$scientificName)
+
+n.species <- length(species)
+```
+
+There have been at least one observation of `r print(n.species)` 
+Lepidoptera (moths & caterpillars) species in Vermont. 
+
+### Below are the results for:
+
+# `r params$species_val`
+
+```{r,warning = FALSE, message = FALSE}
+num_obs <- queryAPI(query = list(paste0("taxon_name:","\"",params$species_val,"\"")),
+                    type = "TotalObs")
+```
+```{r, eval = FALSE}
+# if the number of observations is less than 50 it terminates R. 
+if(num_obs < 50){q(save = "no", status = 1)}
+```
+
+```{r,warning = FALSE, message = FALSE}
+### 3) Grab data using API 
+
+a <- Sys.time()
+VAL_data <- queryAPI(query = list(paste0("taxon_name:","\"",params$species_val,"\"")),
+                    type = "occurrences")
+Sys.time()-a
+```
+
+
+very basic use of MaxEnt model 
+```{r, warning = FALSE, message = FALSE}
+
+### 4) Set up maxent analysis 
+#       a) just state of VT parameters?
+#       b) larger area and model in VT?
+    
+# make into spatial points data frame
+VAL_data <- sf::st_as_sf(VAL_data[!is.na(VAL_data$decimalLongitude),], 
+                         coords = c("decimalLongitude", "decimalLatitude"), 
+                         crs = 4326, agr = "constant")
+
+# remove duplicate locations 
+# need to do that with sf 
+
+# witholding a 25% sample for testing
+fold <- kfold(VAL_data, k = 5)
+testData <- VAL_data[fold == 1, ]
+trainingData <- VAL_data[fold != 1, ]
+```
+
+```{r, message = FALSE, warning = FALSE}
+# THIS WILL ULTIMATELY PULL FROM A POSTGIS DATABASE 
+
+boundary <- st_read(SpatialDb, "boundary", quiet = TRUE)
+towns <- st_read(SpatialDb, "towns", quiet = TRUE)
+
+
+## -----------------------------------------------------------------------------
+# THESE ENV DATA NEED TO BE PROCESSED AND PLACED IN A DATABSE WITH THE SAME
+# RESOLUTION, EXTENT, ETC. 
+
+# Keep only 
+#BIO01 = Mean Annual Temp
+#BIO06 = Min Temp Coldest Month
+#BIO12 = Annual Precipitation
+#BIO13 = Precipitation of Wettest Month
+#BIO14 = Precipitation of Driest Month
+
+
+EnvData <- pgGetRast(SpatialDb,
+                     name = "WorldClim_bio_current",
+                     bands = c(1,6,12,13,14))
+
+FutEnv <- pgGetRast(SpatialDb,
+                    name = "WorldClim_bio_2050_AC_85",
+                    bands = c(1,6,12,13,14))
+
+Elev <- pgGetRast(SpatialDb,
+                     name = "SRTM_DEM",
+                     bands = 1)
+
+elev <- resample(Elev, EnvData)
+
+EnvData <- stack(EnvData,elev)
+
+elev_fut <- resample(Elev,FutEnv)
+
+FutEnv <- stack(FutEnv, elev_fut)
+
+```
+
+
+### Habitat suitability - Maxent
+
+```{r, warning = FALSE, message = FALSE, results='hide'}
+#fit the maxent model
+
+# Note - need to make elevation raster compatible with other layers @ 
+
+# Run maxent with full dataset
+MaxEnt_model <- maxent(x = EnvData, p = st_coordinates(trainingData))
+
+# make predictions
+suitHab <- predict(MaxEnt_model, EnvData)
+
+# background data
+bg <- randomPoints(EnvData, 1000) #background "pseudoabsences"
+
+#simplest way to use 'evaluate'
+AUCeval <- evaluate(MaxEnt_model, p=testData, a=bg, x=EnvData)
+```
+
+```{r, echo = FALSE, dpi = 400}
+
+
+set.breaks <- seq(0, 1, 0.01)
+occcol <- colorRampPalette(rev(c("#4b2991",
+            "#872ca2",
+            "#c0369d",
+            "#ea4f88",
+            "#fa7876",
+            "#f6a97a",
+            "#edd9a3","gray88")))(length(set.breaks))
+
+#tiff("HabitatSuitability.tiff",res = 600, height = 3600, width = 3600, units = "px",compress = "lzw")
+par(mar = c(0,0,0,0))
+plot(st_geometry(towns),col = "gray88")
+image(mask(EnvData$srtm_merged,boundary), col = grey(100:1/100), add = TRUE)
+plot(suitHab,breaks = set.breaks,col = occcol,legend = FALSE,
+     axes = FALSE, add = TRUE, alpha = 0.7)
+plot(st_geometry(towns), add = TRUE, border = "white", lwd = 0.3)
+plot(st_geometry(boundary), add = TRUE, lwd = 1.2)
+plot(suitHab,
+     legend.only = TRUE,
+    horizontal = TRUE,
+    col= occcol,
+    add = TRUE,
+     breaks = set.breaks,
+    smallplot = c(0.025,0.325,0.17,0.19),
+     legend.width = 0.25,
+     legend.shrink = 0.5,
+     axis.args = list(at = seq(0,1,0.1),
+                      las = 1,
+                      labels = seq(0,1,0.1),
+                      cex.axis = 1,
+                      mgp = c(5,0.3,0)),
+     legend.args = list(text = "Predicted\n Habitat Suitability", 
+                      side = 3, 
+                      font = 2, 
+                      line = 0.5, 
+                      cex = 1))
+#sppImg <- stack("G:/Spp_Images/Panopoda_rufimargo.jpg")
+#par(bty = "l", new = TRUE, fig = c(0.55,0.95,0.05,0.55))
+#plotRGB(sppImg, r=1,g=2,b=3,colNA = "black")
+par(bty = "l",new = TRUE, fig = c(0.05,0.29,0.55,0.75),mar = c(1,1,1,1))
+plot(AUCeval, 'ROC',type = "l",
+     col = "black",lwd = 2,las = 1,main = "",cex.axis = 0.75,axes = FALSE,xaxt = "n")
+axis(1,tck = -0.05,labels = seq(0,1,0.2),at = seq(0,1,0.2),cex.axis = 0.75,mgp = c(3, 0.2, 0.05),las = 1)
+axis(2,las =2,tck = -0.05,labels = seq(0,1,0.2),at = seq(0,1,0.2),cex.axis = 0.75,mgp = c(3, 0.2, 0))
+mtext(side = 1,text = "False positive rate",line = 1,cex = 0.75)
+mtext(side = 2,text = "True positive rate",line = 1.2, cex = 0.75)
+#dev.off()
+#system("open HabitatSuitability.tiff")
+```
+       
+### 6) Create a phenology figure 
+```{r, warning = FALSE, message = FALSE}
+VAL_data$observed <- 1
+
+pheno <- tapply(VAL_data$observed,
+                list(VAL_data$month),
+                FUN = sum)
+
+monthly_data <- array(0,c(1,12))
+names(monthly_data) <- formatC(1:12, width = 2, flag = 0)
+
+monthly_data[1,match(names(pheno),names(monthly_data))] <- pheno
+
+par(bty = "l")
+plot(monthly_data[1,]~c(1:12),
+     las = 1, 
+     ylab = "Number of observations",
+     xlab = "Month",
+     main = params$species_val,
+     pch = 19, col = "gray")
+
+
+# NEED TO AUTOMATE THE SPAN VALUE SOMEHOW
+# see http://r-statistics.co/Loess-Regression-With-R.html
+
+#loess_model <- loess(monthly_data[1,] ~ c(1:12), span=0.6)
+
+mon <- 1:12
+# define function that returns the SSE
+loess_model <- fANCOVA::loess.as(mon,
+                     monthly_data[1,], 
+                     degree = 1,
+                     criterion = c("aicc", "gcv")[2], 
+                     user.span = NULL, plot = F)
+
+smooth <- predict(loess_model, seq(1,12,,100))
+
+points(smooth~seq(1,12,,100), type = "l")
+```
+
+
+### 7) Projections based on climate 
+
+```{r, results='hide'}
+# make predictions
+FutHab <- predict(MaxEnt_model, FutEnv)
+
+```
+
+```{r, echo = FALSE, dpi = 400}
+FutHub_samp <- resample(FutHab,suitHab)
+
+set.breaks <- seq(0,1,0.01)
+occcol <- colorRampPalette(rev(c("#4b2991",
+            "#872ca2",
+            "#c0369d",
+            "#ea4f88",
+            "#fa7876",
+            "#f6a97a",
+            "#edd9a3","gray88")))(length(set.breaks))
+
+#tiff("HabitatSuitability.tiff",res = 600, height = 3600, width = 3600, units = "px",compress = "lzw")
+par(mar = c(0,0,0,0))
+plot(st_geometry(towns),col = "gray88")
+image(mask(EnvData$srtm_merged,boundary), col = grey(100:1/100), add = TRUE)
+plot(FutHub_samp,breaks = set.breaks,col = occcol,legend = FALSE,
+     axes = FALSE, add = TRUE, alpha = 0.5)
+plot(st_geometry(towns), add = TRUE, border = "white", lwd  = 0.2)
+plot(st_geometry(boundary), add = TRUE, lwd = 2)
+plot(FutHub_samp,
+     legend.only = TRUE,
+    horizontal = TRUE,
+    col= occcol,
+    add = TRUE,
+     breaks = set.breaks,
+    smallplot = c(0.025,0.325,0.17,0.19),
+     legend.width = 0.25,
+     legend.shrink = 0.5,
+     axis.args = list(at = seq(0,1,0.1),
+                      las = 1,
+                      labels = seq(0,1,0.1),
+                      cex.axis = 1,
+                      mgp = c(5,0.3,0)),
+     legend.args = list(text = "Future\n Habitat Suitability", 
+                      side = 3, 
+                      font = 2, 
+                      line = 0.5, 
+                      cex = 1))
+#sppImg <- stack("G:/Spp_Images/Panopoda_rufimargo.jpg")
+#par(bty = "l", new = TRUE, fig = c(0.55,0.95,0.05,0.55))
+#plotRGB(sppImg, r=1,g=2,b=3,colNA = "black")
+par(bty = "l",new = TRUE, fig = c(0.05,0.29,0.55,0.75),mar = c(1,1,1,1))
+plot(AUCeval, 'ROC',type = "l",
+     col = "black",lwd = 2,las = 1,main = "",cex.axis = 0.75,axes = FALSE,xaxt = "n")
+axis(1,tck = -0.05,labels = seq(0,1,0.2),at = seq(0,1,0.2),cex.axis = 0.75,mgp = c(3, 0.2, 0.05),las = 1)
+axis(2,las =2,tck = -0.05,labels = seq(0,1,0.2),at = seq(0,1,0.2),cex.axis = 0.75,mgp = c(3, 0.2, 0))
+mtext(side = 1,text = "False positive rate",line = 1,cex = 0.75)
+mtext(side = 2,text = "True positive rate",line = 1.2, cex = 0.75)
+#dev.off()
+```
+
+
+### Decline 
+
+The difference between the two scenarios - currently CMIP5 - model: AC 8.5
+```{r, echo = FALSE}
+
+FutHub_samp <- resample(FutHab,suitHab)
+
+diffHab <- FutHub_samp-suitHab
+
+
+
+set.breaks <- seq(-1,1,0.01)
+diffcol <- colorRampPalette(rev(c("#009392",
+            "#72aaa1",
+            "#b1c7b3",
+            "#f1eac8",
+            "#e5b9ad",
+            "#d98994",
+            "#d0587e")))(length(set.breaks))
+
+#tiff("HabitatSuitability.tiff",res = 600, height = 3600, width = 3600, units = "px",compress = "lzw")
+par(mar = c(0,0,0,0))
+plot(st_geometry(towns),col = "gray88")
+plot(diffHab ,breaks = set.breaks,col = diffcol,legend = FALSE,
+     axes = FALSE, add = TRUE)
+plot(st_geometry(towns), add = TRUE, border = "white", lwd = 0.2)
+plot(st_geometry(boundary), add = TRUE, lwd = 1.2)
+plot(diffHab,
+     legend.only = TRUE,
+    horizontal = TRUE,
+    col= diffcol,
+    add = TRUE,
+     breaks = set.breaks,
+    smallplot = c(0.025,0.325,0.17,0.19),
+     legend.width = 0.25,
+     legend.shrink = 0.5,
+     axis.args = list(at = seq(-1,1,0.25),
+                      las = 1,
+                      labels = seq(-1,1,0.25),
+                      cex.axis = 1,
+                      mgp = c(5,0.3,0)),
+     legend.args = list(text = "Future\n Habitat Suitability", 
+                      side = 3, 
+                      font = 2, 
+                      line = 0.5, 
+                      cex = 1))
+#sppImg <- stack("G:/Spp_Images/Panopoda_rufimargo.jpg")
+#par(bty = "l", new = TRUE, fig = c(0.55,0.95,0.05,0.55))
+#plotRGB(sppImg, r=1,g=2,b=3,colNA = "black")
+#par(bty = "l",new = TRUE, fig = c(0.05,0.29,0.55,0.75),mar = c(1,1,1,1))
+
+```
